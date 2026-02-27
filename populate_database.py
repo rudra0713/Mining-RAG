@@ -1,109 +1,85 @@
 import argparse
 import os
 import shutil
-from langchain.document_loaders.pdf import PyPDFDirectoryLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pdf_splitter_test import extract_sections
 from langchain.schema.document import Document
-from get_embedding_function import get_embedding_function
 from langchain.vectorstores.chroma import Chroma
-
+from chromadb import PersistentClient
+from chromadb.config import Settings
+from get_embedding_function import get_embedding_function
 
 CHROMA_PATH = "chroma"
 DATA_PATH = "data"
 
 
 def main():
-
-    # Check if the database should be cleared (using the --clear flag).
     parser = argparse.ArgumentParser()
     parser.add_argument("--reset", action="store_true", help="Reset the database.")
+    parser.add_argument("--pdf_path", type=str,
+                        default="data/2024_Joint_Application_Information_Requirements.pdf",
+                        help="Path to the PDF file.")
+    parser.add_argument("--embedding", type=str, default="ollama_nomic",
+                        choices=["ollama_nomic", "ollama_mxbai", "ollama_minilm", "openai", "bge_large", "e5_large", "mpnet", "bge_m3", "bedrock"],
+                        help="Which embedding type to use.")
     args = parser.parse_args()
+
     if args.reset:
-        print("✨ Clearing Database")
-        clear_database()
+        print(f"✨ Clearing Database for embedding={args.embedding}")
+        clear_database(args.embedding)
 
-    # Create (or update) the data store.
-    documents = load_documents()
-    chunks = split_documents(documents)
-    add_to_chroma(chunks)
+    documents = load_documents(args.pdf_path)
+    add_to_chroma(documents, args.embedding)
 
 
-def load_documents():
-    document_loader = PyPDFDirectoryLoader(DATA_PATH)
-    return document_loader.load()
+def load_documents(pdf_path: str) -> list:
+    sections = extract_sections(pdf_path)
+    documents = []
+    for section in sections:
+        documents.append(Document(
+            page_content=section["text"],
+            metadata={
+                "source": pdf_path,
+                "section_number": section["section_number"],
+                "title": section["title"],
+                "page": section["page"]
+            }
+        ))
+    print(f"total documents: {len(documents)}")
+    return documents
 
 
-def split_documents(documents: list[Document]):
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=80,
-        length_function=len,
-        is_separator_regex=False,
+def add_to_chroma(documents: list[Document], embedding_type: str):
+    client = PersistentClient(
+        path=CHROMA_PATH,
+        settings=Settings(anonymized_telemetry=False)
     )
-    return text_splitter.split_documents(documents)
 
-
-def add_to_chroma(chunks: list[Document]):
-    # Load the existing database.
+    collection_name = f"my_collection_{embedding_type}"
     db = Chroma(
-        persist_directory=CHROMA_PATH, embedding_function=get_embedding_function()
+        client=client,
+        collection_name=collection_name,
+        embedding_function=get_embedding_function(embedding_type),
+        collection_metadata={"hnsw:space": "cosine"}
     )
 
-    # Calculate Page IDs.
-    chunks_with_ids = calculate_chunk_ids(chunks)
-
-    # Add or Update the documents.
-    existing_items = db.get(include=[])  # IDs are always included by default
+    existing_items = db.get(include=[])
     existing_ids = set(existing_items["ids"])
-    print(f"Number of existing documents in DB: {len(existing_ids)}")
+    print(f"Number of existing documents in DB ({collection_name}): {len(existing_ids)}")
 
-    # Only add documents that don't exist in the DB.
-    new_chunks = []
-    for chunk in chunks_with_ids:
-        if chunk.metadata["id"] not in existing_ids:
-            new_chunks.append(chunk)
-
-    if len(new_chunks):
-        print(f"👉 Adding new documents: {len(new_chunks)}")
-        new_chunk_ids = [chunk.metadata["id"] for chunk in new_chunks]
-        db.add_documents(new_chunks, ids=new_chunk_ids)
-        db.persist()
+    new_documents = [doc for doc in documents if doc.metadata["section_number"] not in existing_ids]
+    if new_documents:
+        print(f"👉 Adding new documents: {len(new_documents)}")
+        new_doc_ids = [doc.metadata["section_number"] for doc in new_documents]
+        db.add_documents(new_documents, ids=new_doc_ids)
     else:
         print("✅ No new documents to add")
 
 
-def calculate_chunk_ids(chunks):
-
-    # This will create IDs like "data/monopoly.pdf:6:2"
-    # Page Source : Page Number : Chunk Index
-
-    last_page_id = None
-    current_chunk_index = 0
-
-    for chunk in chunks:
-        source = chunk.metadata.get("source")
-        page = chunk.metadata.get("page")
-        current_page_id = f"{source}:{page}"
-
-        # If the page ID is the same as the last one, increment the index.
-        if current_page_id == last_page_id:
-            current_chunk_index += 1
-        else:
-            current_chunk_index = 0
-
-        # Calculate the chunk ID.
-        chunk_id = f"{current_page_id}:{current_chunk_index}"
-        last_page_id = current_page_id
-
-        # Add it to the page meta-data.
-        chunk.metadata["id"] = chunk_id
-
-    return chunks
-
-
-def clear_database():
-    if os.path.exists(CHROMA_PATH):
-        shutil.rmtree(CHROMA_PATH)
+def clear_database(embedding_type: str):
+    collection_dir = os.path.join(CHROMA_PATH, f"my_collection_{embedding_type}")
+    if os.path.exists(collection_dir):
+        shutil.rmtree(collection_dir)
+        print(f"Deleted collection: {collection_dir}")
 
 
 if __name__ == "__main__":
